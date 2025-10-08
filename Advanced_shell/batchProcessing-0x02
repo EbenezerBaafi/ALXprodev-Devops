@@ -15,17 +15,163 @@ ERROR_FILE="pokemon_errors.txt"
 # Delay between requests (in seconds) to avoid rate limiting
 DELAY=2
 
+# Maximum retry attempts
+MAX_RETRIES=3
+
+# Retry delay (in seconds)
+RETRY_DELAY=3
+
 # Create output directory if it doesn't exist
 mkdir -p "$OUTPUT_DIR"
 
 # Initialize counters
 success_count=0
 fail_count=0
+retry_count=0
 
 echo "=========================================="
 echo "Starting Pokémon Data Retrieval"
 echo "=========================================="
 echo ""
+
+# Function to make API request with retry logic
+fetch_pokemon_data() {
+    local pokemon=$1
+    local api_url=$2
+    local output_file=$3
+    local attempt=1
+    
+    while [ $attempt -le $MAX_RETRIES ]; do
+        # Make API request with HTTP status code and connection timeout
+        response=$(curl -s -w "\n%{http_code}" --connect-timeout 10 --max-time 30 "$api_url" 2>&1)
+        
+        # Check if curl command itself failed
+        curl_exit_code=$?
+        
+        if [ $curl_exit_code -ne 0 ]; then
+            # Curl command failed (network error, timeout, etc.)
+            echo "  ⚠ Attempt $attempt/$MAX_RETRIES: Network error (curl exit code: $curl_exit_code)"
+            
+            if [ $attempt -lt $MAX_RETRIES ]; then
+                echo "  ⏳ Retrying in ${RETRY_DELAY} seconds..."
+                sleep "$RETRY_DELAY"
+                ((attempt++))
+                ((retry_count++))
+                continue
+            else
+                # Max retries reached
+                timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+                error_msg="[$timestamp] Error: Network failure after $MAX_RETRIES attempts - Failed to retrieve data for $pokemon (curl exit code: $curl_exit_code)"
+                echo "$error_msg" >> "$ERROR_FILE"
+                return 1
+            fi
+        fi
+        
+        # Extract HTTP status code (last line)
+        http_code=$(echo "$response" | tail -n 1)
+        
+        # Extract response body (everything except last line)
+        body=$(echo "$response" | sed '$d')
+        
+        # Check if we got a valid HTTP status code
+        if ! [[ "$http_code" =~ ^[0-9]+$ ]]; then
+            echo "  ⚠ Attempt $attempt/$MAX_RETRIES: Invalid response received"
+            
+            if [ $attempt -lt $MAX_RETRIES ]; then
+                echo "  ⏳ Retrying in ${RETRY_DELAY} seconds..."
+                sleep "$RETRY_DELAY"
+                ((attempt++))
+                ((retry_count++))
+                continue
+            else
+                timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+                error_msg="[$timestamp] Error: Invalid response after $MAX_RETRIES attempts - Failed to retrieve data for $pokemon"
+                echo "$error_msg" >> "$ERROR_FILE"
+                return 1
+            fi
+        fi
+        
+        # Check if request was successful (status code 200)
+        if [ "$http_code" -eq 200 ]; then
+            # Validate that we received JSON data
+            if echo "$body" | jq empty 2>/dev/null; then
+                # Save response to file
+                echo "$body" > "$output_file"
+                
+                if [ $attempt -eq 1 ]; then
+                    echo "✓ Success: Data saved to $output_file"
+                else
+                    echo "✓ Success (after $attempt attempts): Data saved to $output_file"
+                fi
+                return 0
+            else
+                echo "  ⚠ Attempt $attempt/$MAX_RETRIES: Invalid JSON received"
+                
+                if [ $attempt -lt $MAX_RETRIES ]; then
+                    echo "  ⏳ Retrying in ${RETRY_DELAY} seconds..."
+                    sleep "$RETRY_DELAY"
+                    ((attempt++))
+                    ((retry_count++))
+                    continue
+                else
+                    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+                    error_msg="[$timestamp] Error: Invalid JSON after $MAX_RETRIES attempts - Failed to retrieve data for $pokemon"
+                    echo "$error_msg" >> "$ERROR_FILE"
+                    return 1
+                fi
+            fi
+        elif [ "$http_code" -eq 404 ]; then
+            # 404 means Pokémon not found - no need to retry
+            echo "✗ Failed: Pokémon '$pokemon' not found (HTTP 404)"
+            timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+            error_msg="[$timestamp] Error: HTTP 404 - Pokémon '$pokemon' not found (invalid name)"
+            echo "$error_msg" >> "$ERROR_FILE"
+            return 1
+        elif [ "$http_code" -ge 500 ]; then
+            # Server error - retry
+            echo "  ⚠ Attempt $attempt/$MAX_RETRIES: Server error (HTTP $http_code)"
+            
+            if [ $attempt -lt $MAX_RETRIES ]; then
+                echo "  ⏳ Retrying in ${RETRY_DELAY} seconds..."
+                sleep "$RETRY_DELAY"
+                ((attempt++))
+                ((retry_count++))
+                continue
+            else
+                timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+                error_msg="[$timestamp] Error: HTTP $http_code after $MAX_RETRIES attempts - Failed to retrieve data for $pokemon"
+                echo "$error_msg" >> "$ERROR_FILE"
+                return 1
+            fi
+        elif [ "$http_code" -eq 429 ]; then
+            # Rate limit - wait longer and retry
+            echo "  ⚠ Attempt $attempt/$MAX_RETRIES: Rate limited (HTTP 429)"
+            
+            if [ $attempt -lt $MAX_RETRIES ]; then
+                local wait_time=$((RETRY_DELAY * 2))
+                echo "  ⏳ Waiting ${wait_time} seconds before retry..."
+                sleep "$wait_time"
+                ((attempt++))
+                ((retry_count++))
+                continue
+            else
+                timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+                error_msg="[$timestamp] Error: Rate limited (HTTP 429) after $MAX_RETRIES attempts - Failed to retrieve data for $pokemon"
+                echo "$error_msg" >> "$ERROR_FILE"
+                return 1
+            fi
+        else
+            # Other HTTP error
+            echo "✗ Failed: HTTP $http_code for $pokemon"
+            timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+            error_msg="[$timestamp] Error: HTTP $http_code - Failed to retrieve data for $pokemon"
+            echo "$error_msg" >> "$ERROR_FILE"
+            return 1
+        fi
+    done
+    
+    return 1
+}
 
 # Loop through each Pokémon
 for pokemon in "${POKEMON_LIST[@]}"; do
@@ -40,29 +186,12 @@ for pokemon in "${POKEMON_LIST[@]}"; do
     # Output file path
     output_file="${OUTPUT_DIR}/${pokemon_lower}.json"
     
-    # Make API request with HTTP status code
-    response=$(curl -s -w "\n%{http_code}" "$api_url")
-    
-    # Extract HTTP status code (last line)
-    http_code=$(echo "$response" | tail -n 1)
-    
-    # Extract response body (everything except last line)
-    body=$(echo "$response" | sed '$d')
-    
-    # Check if request was successful (status code 200)
-    if [ "$http_code" -eq 200 ]; then
-        # Save response to file
-        echo "$body" > "$output_file"
-        echo "✓ Success: Data saved to $output_file"
+    # Attempt to fetch data with retry logic
+    if fetch_pokemon_data "$pokemon_lower" "$api_url" "$output_file"; then
         ((success_count++))
     else
-        # Log error
-        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-        error_msg="[$timestamp] Error: HTTP $http_code - Failed to retrieve data for $pokemon_lower"
-        echo "$error_msg" >> "$ERROR_FILE"
-        echo "✗ Failed: HTTP $http_code for $pokemon_lower"
-        echo "  Error logged to $ERROR_FILE"
         ((fail_count++))
+        echo "  Error logged to $ERROR_FILE"
     fi
     
     # Add delay between requests to avoid rate limiting
@@ -82,6 +211,7 @@ echo "=========================================="
 echo "Total Pokémon processed: ${#POKEMON_LIST[@]}"
 echo "Successful: $success_count"
 echo "Failed: $fail_count"
+echo "Total retry attempts: $retry_count"
 echo ""
 
 if [ $success_count -gt 0 ]; then
@@ -92,6 +222,7 @@ fi
 
 if [ $fail_count -gt 0 ]; then
     echo ""
+    echo "⚠ Warning: $fail_count Pokémon failed after retry attempts"
     echo "Errors logged in: $ERROR_FILE"
 fi
 
