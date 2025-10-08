@@ -1,0 +1,259 @@
+#!/bin/bash
+
+# API base URL
+API_BASE_URL="https://pokeapi.co/api/v2/pokemon"
+
+# List of Pokémon to fetch
+POKEMON_LIST=("bulbasaur" "ivysaur" "venusaur" "charmander" "charmeleon")
+
+# Output directory for JSON files
+OUTPUT_DIR="pokemon_data"
+
+# Error log file
+ERROR_FILE="pokemon_errors.txt"
+
+# Status directory for tracking parallel jobs
+STATUS_DIR="pokemon_status"
+
+# Maximum retry attempts
+MAX_RETRIES=3
+
+# Retry delay (in seconds)
+RETRY_DELAY=2
+
+# Maximum number of parallel processes
+MAX_PARALLEL=5
+
+# Create necessary directories
+mkdir -p "$OUTPUT_DIR"
+mkdir -p "$STATUS_DIR"
+
+# Clear status directory
+rm -f "$STATUS_DIR"/*
+
+echo "=========================================="
+echo "Parallel Pokémon Data Retrieval"
+echo "=========================================="
+echo "Max parallel processes: $MAX_PARALLEL"
+echo "Total Pokémon to fetch: ${#POKEMON_LIST[@]}"
+echo ""
+
+# Function to fetch a single Pokémon's data
+fetch_pokemon() {
+    local pokemon=$1
+    local pokemon_lower=$(echo "$pokemon" | tr '[:upper:]' '[:lower:]')
+    local api_url="${API_BASE_URL}/${pokemon_lower}"
+    local output_file="${OUTPUT_DIR}/${pokemon_lower}.json"
+    local status_file="${STATUS_DIR}/${pokemon_lower}.status"
+    local attempt=1
+    
+    # Write initial status
+    echo "PROCESSING" > "$status_file"
+    
+    while [ $attempt -le $MAX_RETRIES ]; do
+        # Make API request with timeout
+        response=$(curl -s -w "\n%{http_code}" --connect-timeout 10 --max-time 30 "$api_url" 2>&1)
+        curl_exit_code=$?
+        
+        # Check if curl succeeded
+        if [ $curl_exit_code -ne 0 ]; then
+            if [ $attempt -lt $MAX_RETRIES ]; then
+                sleep "$RETRY_DELAY"
+                ((attempt++))
+                continue
+            else
+                timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+                echo "[$timestamp] Error: Network failure for $pokemon_lower (curl exit: $curl_exit_code)" >> "$ERROR_FILE"
+                echo "FAILED" > "$status_file"
+                return 1
+            fi
+        fi
+        
+        # Extract HTTP status code
+        http_code=$(echo "$response" | tail -n 1)
+        body=$(echo "$response" | sed '$d')
+        
+        # Validate HTTP status code format
+        if ! [[ "$http_code" =~ ^[0-9]+$ ]]; then
+            if [ $attempt -lt $MAX_RETRIES ]; then
+                sleep "$RETRY_DELAY"
+                ((attempt++))
+                continue
+            else
+                timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+                echo "[$timestamp] Error: Invalid response for $pokemon_lower" >> "$ERROR_FILE"
+                echo "FAILED" > "$status_file"
+                return 1
+            fi
+        fi
+        
+        # Handle different HTTP status codes
+        if [ "$http_code" -eq 200 ]; then
+            # Validate JSON
+            if echo "$body" | jq empty 2>/dev/null; then
+                echo "$body" > "$output_file"
+                echo "SUCCESS:$attempt" > "$status_file"
+                return 0
+            else
+                if [ $attempt -lt $MAX_RETRIES ]; then
+                    sleep "$RETRY_DELAY"
+                    ((attempt++))
+                    continue
+                else
+                    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+                    echo "[$timestamp] Error: Invalid JSON for $pokemon_lower" >> "$ERROR_FILE"
+                    echo "FAILED" > "$status_file"
+                    return 1
+                fi
+            fi
+        elif [ "$http_code" -eq 404 ]; then
+            timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+            echo "[$timestamp] Error: HTTP 404 - Pokémon '$pokemon_lower' not found" >> "$ERROR_FILE"
+            echo "FAILED" > "$status_file"
+            return 1
+        elif [ "$http_code" -ge 500 ] || [ "$http_code" -eq 429 ]; then
+            if [ $attempt -lt $MAX_RETRIES ]; then
+                sleep "$RETRY_DELAY"
+                ((attempt++))
+                continue
+            else
+                timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+                echo "[$timestamp] Error: HTTP $http_code for $pokemon_lower after $MAX_RETRIES attempts" >> "$ERROR_FILE"
+                echo "FAILED" > "$status_file"
+                return 1
+            fi
+        else
+            timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+            echo "[$timestamp] Error: HTTP $http_code for $pokemon_lower" >> "$ERROR_FILE"
+            echo "FAILED" > "$status_file"
+            return 1
+        fi
+    done
+    
+    echo "FAILED" > "$status_file"
+    return 1
+}
+
+# Array to store background process IDs
+declare -a PIDS=()
+
+# Start time
+start_time=$(date +%s)
+
+echo "Starting parallel fetch operations..."
+echo ""
+
+# Launch parallel processes
+for pokemon in "${POKEMON_LIST[@]}"; do
+    # Wait if we've reached the maximum number of parallel processes
+    while [ ${#PIDS[@]} -ge $MAX_PARALLEL ]; do
+        # Check which processes have completed
+        for i in "${!PIDS[@]}"; do
+            pid=${PIDS[$i]}
+            if ! kill -0 "$pid" 2>/dev/null; then
+                # Process completed, remove from array
+                unset 'PIDS[$i]'
+            fi
+        done
+        
+        # Rebuild array to remove gaps
+        PIDS=("${PIDS[@]}")
+        
+        # Brief sleep to avoid busy waiting
+        sleep 0.1
+    done
+    
+    # Launch fetch in background
+    pokemon_lower=$(echo "$pokemon" | tr '[:upper:]' '[:lower:]')
+    echo "→ Starting fetch for: $pokemon_lower (PID will be assigned)"
+    fetch_pokemon "$pokemon" &
+    pid=$!
+    PIDS+=("$pid")
+    echo "  Process ID: $pid"
+done
+
+echo ""
+echo "All fetch processes launched. Waiting for completion..."
+echo ""
+
+# Wait for all background processes to complete
+for pid in "${PIDS[@]}"; do
+    wait "$pid"
+done
+
+# Calculate elapsed time
+end_time=$(date +%s)
+elapsed=$((end_time - start_time))
+
+echo "All processes completed in ${elapsed} seconds."
+echo ""
+
+# Process results
+echo "=========================================="
+echo "Processing Results"
+echo "=========================================="
+echo ""
+
+success_count=0
+fail_count=0
+retry_count=0
+
+for pokemon in "${POKEMON_LIST[@]}"; do
+    pokemon_lower=$(echo "$pokemon" | tr '[:upper:]' '[:lower:]')
+    status_file="${STATUS_DIR}/${pokemon_lower}.status"
+    
+    if [ -f "$status_file" ]; then
+        status=$(cat "$status_file")
+        
+        if [[ "$status" == SUCCESS* ]]; then
+            attempts=$(echo "$status" | cut -d':' -f2)
+            pokemon_display=$(echo "$pokemon_lower" | sed 's/^./\u&/')
+            
+            if [ "$attempts" -eq 1 ]; then
+                echo "✓ $pokemon_display: Success"
+            else
+                echo "✓ $pokemon_display: Success (after $attempts attempts)"
+                ((retry_count += attempts - 1))
+            fi
+            ((success_count++))
+        else
+            pokemon_display=$(echo "$pokemon_lower" | sed 's/^./\u&/')
+            echo "✗ $pokemon_display: Failed"
+            ((fail_count++))
+        fi
+    else
+        pokemon_display=$(echo "$pokemon_lower" | sed 's/^./\u&/')
+        echo "✗ $pokemon_display: No status (process error)"
+        ((fail_count++))
+    fi
+done
+
+# Print summary
+echo ""
+echo "=========================================="
+echo "Summary"
+echo "=========================================="
+echo "Total Pokémon processed: ${#POKEMON_LIST[@]}"
+echo "Successful: $success_count"
+echo "Failed: $fail_count"
+echo "Total retry attempts: $retry_count"
+echo "Total time: ${elapsed} seconds"
+echo ""
+
+if [ $success_count -gt 0 ]; then
+    echo "Data files saved in: $OUTPUT_DIR/"
+    echo "Files created:"
+    ls -1 "$OUTPUT_DIR"/*.json 2>/dev/null | sed 's/^/  - /'
+fi
+
+if [ $fail_count -gt 0 ]; then
+    echo ""
+    echo "⚠ Warning: $fail_count Pokémon failed"
+    echo "Errors logged in: $ERROR_FILE"
+fi
+
+# Cleanup status directory
+rm -rf "$STATUS_DIR"
+
+echo ""
+echo "Done!"
