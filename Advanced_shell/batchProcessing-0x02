@@ -220,7 +220,7 @@ if [ $success_count -gt 0 ]; then
     ls -1 "$OUTPUT_DIR"/*.json 2>/dev/null | sed 's/^/  - /'
 fi
 
-if [ $fail_count -gt 0 ]; then
+if [ $fail_count -gt 3 ]; then
     echo ""
     echo "⚠ Warning: $fail_count Pokémon failed after retry attempts"
     echo "Errors logged in: $ERROR_FILE"
