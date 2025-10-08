@@ -1,0 +1,144 @@
+#!/bin/bash
+
+# Directory containing JSON files
+INPUT_DIR="pokemon_data"
+
+# Output CSV file
+OUTPUT_CSV="pokemon_report.csv"
+
+# Temporary file for data processing
+TEMP_FILE="temp_data.txt"
+
+# Check if input directory exists
+if [ ! -d "$INPUT_DIR" ]; then
+    echo "Error: Directory $INPUT_DIR not found!"
+    echo "Please run the fetch script first to generate Pokémon data."
+    exit 1
+fi
+
+# Check if there are any JSON files
+json_count=$(ls -1 "$INPUT_DIR"/*.json 2>/dev/null | wc -l)
+if [ "$json_count" -eq 0 ]; then
+    echo "Error: No JSON files found in $INPUT_DIR/"
+    exit 1
+fi
+
+echo "=========================================="
+echo "Pokémon Data Report Generator"
+echo "=========================================="
+echo ""
+echo "Processing $json_count Pokémon..."
+echo ""
+
+# Create CSV header
+echo "Name,Height(m),Weight(kg)" > "$OUTPUT_CSV"
+
+# Clear temporary file
+> "$TEMP_FILE"
+
+# Process each JSON file
+for json_file in "$INPUT_DIR"/*.json; do
+    # Extract data using jq
+    name=$(jq -r '.name' "$json_file" 2>/dev/null)
+    height=$(jq -r '.height' "$json_file" 2>/dev/null)
+    weight=$(jq -r '.weight' "$json_file" 2>/dev/null)
+    
+    # Check if extraction was successful
+    if [ "$name" != "null" ] && [ "$height" != "null" ] && [ "$weight" != "null" ]; then
+        # Capitalize first letter of name
+        name=$(echo "$name" | sed 's/^./\u&/')
+        
+        # Convert height from decimeters to meters
+        height_m=$(echo "$height" | awk '{printf "%.1f", $1/10}')
+        
+        # Convert weight from hectograms to kilograms
+        weight_kg=$(echo "$weight" | awk '{printf "%.1f", $1/10}')
+        
+        # Write to CSV
+        echo "$name,$height_m,$weight_kg" >> "$OUTPUT_CSV"
+        
+        # Write to temp file for average calculation (use original units)
+        echo "$height $weight" >> "$TEMP_FILE"
+        
+        echo "✓ Processed: $name"
+    else
+        echo "✗ Error processing: $json_file"
+    fi
+done
+
+echo ""
+echo "=========================================="
+echo "CSV Report Generated"
+echo "=========================================="
+echo ""
+
+# Display the CSV content
+cat "$OUTPUT_CSV"
+
+echo ""
+echo "=========================================="
+echo "Statistical Summary"
+echo "=========================================="
+echo ""
+
+# Calculate averages using awk
+awk '
+BEGIN {
+    total_height = 0
+    total_weight = 0
+    count = 0
+}
+{
+    total_height += $1
+    total_weight += $2
+    count++
+}
+END {
+    if (count > 0) {
+        avg_height = total_height / count
+        avg_weight = total_weight / count
+        
+        # Convert to proper units
+        avg_height_m = avg_height / 10
+        avg_weight_kg = avg_weight / 10
+        
+        printf "Total Pokémon: %d\n", count
+        printf "Average Height: %.2f meters\n", avg_height_m
+        printf "Average Weight: %.2f kilograms\n", avg_weight_kg
+        printf "\n"
+        
+        # Find min and max
+        # Re-read file for min/max calculation
+    } else {
+        print "No data to calculate averages."
+    }
+}
+' "$TEMP_FILE"
+
+# Calculate min and max using awk
+awk '
+BEGIN {
+    min_height = 999999
+    max_height = 0
+    min_weight = 999999
+    max_weight = 0
+}
+{
+    if ($1 < min_height) min_height = $1
+    if ($1 > max_height) max_height = $1
+    if ($2 < min_weight) min_weight = $2
+    if ($2 > max_weight) max_weight = $2
+}
+END {
+    printf "Height Range: %.1f - %.1f meters\n", min_height/10, max_height/10
+    printf "Weight Range: %.1f - %.1f kilograms\n", min_weight/10, max_weight/10
+}
+' "$TEMP_FILE"
+
+# Clean up temporary file
+rm -f "$TEMP_FILE"
+
+echo ""
+echo "=========================================="
+echo "Report saved to: $OUTPUT_CSV"
+echo "=========================================="
