@@ -11,13 +11,13 @@ ERROR_FILE="errors.txt"
 response=$(curl -s -w "\n%{http_code}" "$API_URL")
 
 # Extract http status code, last line
-http_code=$(echo "response" | tail -n 1)
+http_code=$(echo "$response" | tail -n 1)
 
 # Extract response body (everything except last line)
-body=$(echo "respponse" | sed '$d')
+body=$(echo "$response" | sed '$d')
 
 # Check if request was successful (status code 200)
-if [ "http_code" -eq 200]; then
+if [ "http_code" -eq 200 $ ]; then
     # Save response body to data file
     echo "$body" > "$DATA_FILE"
     echo "Success, pikachu data saved to $DATA_FILE"
@@ -26,6 +26,6 @@ else
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[$timestamp] Error: HTTP $http_code - failed to retrieve pikachu data" >> "$ERROR_FILE"
     echo "Error: request failed with http status code $http_code"
-    echor "Error lodged to $ERROR_FILE"
+    echo "Error lodged to $ERROR_FILE"
     exit 1
 fi
